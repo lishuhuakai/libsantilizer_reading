@@ -100,7 +100,7 @@ public:
         atomic_store(&rss_limit_is_exceeded_, rss_limit_is_exceeded,
                      memory_order_release);
     }
-
+    /* 内存释放 */
     void Deallocate(AllocatorCache *cache, void *p)
     {
         if (!p) return;

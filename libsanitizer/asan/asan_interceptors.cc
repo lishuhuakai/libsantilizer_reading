@@ -36,6 +36,7 @@ namespace __asan
 {
 
 // Return true if we can quickly decide that the region is unpoisoned.
+    /* 判断是否能够快速确定未毒化的region */
     static inline bool QuickCheckForUnpoisonedRegion(uptr beg, uptr size)
     {
         if (size == 0) return true;
@@ -97,6 +98,7 @@ namespace __asan
 // Behavior of functions like "memcpy" or "strcpy" is undefined
 // if memory intervals overlap. We report error in this case.
 // Macro is used to avoid creation of new frames.
+    /* 判断两个range是否发生了重叠 */
     static inline bool RangesOverlap(const char *offset1, uptr length1,
                                      const char *offset2, uptr length2)
     {

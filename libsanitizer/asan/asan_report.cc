@@ -267,7 +267,7 @@ namespace __asan
     StaticSpinMutex ScopedInErrorReport::lock_;
     u32 ScopedInErrorReport::reporting_thread_tid_ = kInvalidTid;
     ErrorDescription ScopedInErrorReport::current_error_;
-
+    /* 打印堆栈溢出 */
     void ReportStackOverflow(const SignalContext &sig)
     {
         ScopedInErrorReport in_report(/*fatal*/ true);
@@ -424,7 +424,7 @@ namespace __asan
         }
         Die();
     }
-
+    /* 打印错误报告 */
     void ReportGenericError(uptr pc, uptr bp, uptr sp, uptr addr, bool is_write,
                             uptr access_size, u32 exp, bool fatal)
     {

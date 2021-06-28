@@ -138,6 +138,10 @@ void __asan_report_ ## type ## size ## _noabort(uptr addr) {        \
   ReportGenericError(pc, bp, sp, addr, is_write, size, 0, false);   \
 }                                                                   \
 
+    // ASAN_REPORT_ERROR(load, false, 1)展开后类似于
+    // __asan_report_load_1(uptr addr)
+    // __asan_report_exp_load_1(uptr addr, u32 exp)
+    // __asan_report_load_1_noabort(uptr addr)
     ASAN_REPORT_ERROR(load, false, 1)
     ASAN_REPORT_ERROR(load, false, 2)
     ASAN_REPORT_ERROR(load, false, 4)
@@ -200,7 +204,7 @@ void __asan_report_ ## type ## _n_noabort(uptr addr, uptr size) {           \
   void __asan_##type##size ## _noabort(uptr addr) {                            \
     ASAN_MEMORY_ACCESS_CALLBACK_BODY(type, is_write, size, 0, false)           \
   }                                                                            \
-
+    /* 访问对应的地址 */
     ASAN_MEMORY_ACCESS_CALLBACK(load, false, 1)
     ASAN_MEMORY_ACCESS_CALLBACK(load, false, 2)
     ASAN_MEMORY_ACCESS_CALLBACK(load, false, 4)
@@ -262,7 +266,7 @@ void __asan_report_ ## type ## _n_noabort(uptr addr, uptr size) {           \
     {
         if (__asan_region_is_poisoned(addr, size))
         {
-            GET_CALLER_PC_BP_SP;
+            GET_CALLER_PC_BP_SP; /* 获取堆栈信息 */
             ReportGenericError(pc, bp, sp, addr, true, size, exp, true);
         }
     }
@@ -492,7 +496,7 @@ void __asan_report_ ## type ## _n_noabort(uptr addr, uptr size) {           \
         DumpProcessMap();
         Die();
     }
-
+    /* 打印内存空间布局 */
     static void PrintAddressSpaceLayout()
     {
         Printf("|| `[%p, %p]` || HighMem    ||\n",

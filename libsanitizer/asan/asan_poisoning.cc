@@ -31,7 +31,11 @@ namespace __asan
     {
         return atomic_load(&can_poison_memory, memory_order_acquire);
     }
-    /* 将地址毒化 */
+    /* 将地址毒化
+     * @param addr 起始地址
+     * @param size 长度
+     * @param value 将从addr开始的size长度的地址空间都标记为value
+     */
     void PoisonShadow(uptr addr, uptr size, u8 value)
     {
         if (!CanPoisonMemory()) return;
@@ -77,7 +81,7 @@ namespace __asan
         uptr shadow_end = RoundDownTo(MemToShadow(p + size), page_size);
         ReleaseMemoryToOS(shadow_beg, shadow_end - shadow_beg);
     }
-
+    /* 将对应的区域标记/取消标记为redzone */
     void AsanPoisonOrUnpoisonIntraObjectRedzone(uptr ptr, uptr size, bool poison)
     {
         uptr end = ptr + size;
@@ -98,6 +102,7 @@ namespace __asan
             ptr |= SHADOW_GRANULARITY - 1;
             ptr++;
         }
+        /* 其实也就是标记为0xbb */
         for (; ptr < end; ptr += SHADOW_GRANULARITY)
             *(u8*)MemToShadow(ptr) = poison ? kAsanIntraObjectRedzone : 0;
     }
@@ -208,6 +213,7 @@ int __asan_address_is_poisoned(void const volatile *addr)
     return __asan::AddressIsPoisoned((uptr)addr);
 }
 
+/* 判断地址是否被毒化(不可访问) */
 uptr __asan_region_is_poisoned(uptr beg, uptr size)
 {
     if (!size) return 0;
@@ -217,8 +223,8 @@ uptr __asan_region_is_poisoned(uptr beg, uptr size)
     CHECK_LT(beg, end);
     uptr aligned_b = RoundUpTo(beg, SHADOW_GRANULARITY);
     uptr aligned_e = RoundDownTo(end, SHADOW_GRANULARITY);
-    uptr shadow_beg = MemToShadow(aligned_b);
-    uptr shadow_end = MemToShadow(aligned_e);
+    uptr shadow_beg = MemToShadow(aligned_b); /* shadow_addr起始地址 */
+    uptr shadow_end = MemToShadow(aligned_e); /* shadow_addr结束地址 */
     // First check the first and the last application bytes,
     // then check the SHADOW_GRANULARITY-aligned region by calling
     // mem_is_zero on the corresponding shadow.
@@ -227,7 +233,7 @@ uptr __asan_region_is_poisoned(uptr beg, uptr size)
         (shadow_end <= shadow_beg ||
          __sanitizer::mem_is_zero((const char *)shadow_beg,
                                   shadow_end - shadow_beg)))
-        return 0;
+        return 0; /* 表示没有被毒化 */
     // The fast check failed, so we have a poisoned byte somewhere.
     // Find it slowly.
     for (; beg < end; beg++)
@@ -250,6 +256,7 @@ uptr __asan_region_is_poisoned(uptr beg, uptr size)
   } while (false);                                            \
 
 
+/* 检查16位的地址 */
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 u16 __sanitizer_unaligned_load16(const uu16 *p)
 {
@@ -271,6 +278,7 @@ u64 __sanitizer_unaligned_load64(const uu64 *p)
     return *p;
 }
 
+/* 所谓的store就是写 */
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __sanitizer_unaligned_store16(uu16 *p, u16 x)
 {
@@ -332,7 +340,7 @@ static void PoisonAlignedStackMemory(uptr addr, uptr size, bool do_poison)
     if (size == 0) return;
     uptr aligned_size = size & ~(SHADOW_GRANULARITY - 1);
     PoisonShadow(addr, aligned_size,
-                 do_poison ? kAsanStackUseAfterScopeMagic : 0);
+                 do_poison ? kAsanStackUseAfterScopeMagic : 0); /* 标记为0xf8 */
     if (size == aligned_size)
         return;
     s8 end_offset = (s8)(size - aligned_size);
@@ -359,16 +367,17 @@ void __asan_set_shadow_00(uptr addr, uptr size)
     REAL(memset)((void *)addr, 0, size);
 }
 
+/* 将对应的shadow memory标记为0xf1 */
 void __asan_set_shadow_f1(uptr addr, uptr size)
 {
     REAL(memset)((void *)addr, 0xf1, size);
 }
-
+/* 将对应的shadow memory标记为0xf2 */
 void __asan_set_shadow_f2(uptr addr, uptr size)
 {
     REAL(memset)((void *)addr, 0xf2, size);
 }
-
+/* 将对应的shadow memory标记为0xf3 */
 void __asan_set_shadow_f3(uptr addr, uptr size)
 {
     REAL(memset)((void *)addr, 0xf3, size);

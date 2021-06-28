@@ -219,17 +219,17 @@ namespace __sanitizer
         IncreaseTotalMmap(size);
         return (void *)p;
     }
-
+    /* 保证从addr开始的size长度的地址无访问权限 */
     bool MprotectNoAccess(uptr addr, uptr size)
     {
         return 0 == internal_mprotect((void*)addr, size, PROT_NONE);
     }
-
+    /* 保证这段地址只能读 */
     bool MprotectReadOnly(uptr addr, uptr size)
     {
         return 0 == internal_mprotect((void *)addr, size, PROT_READ);
     }
-
+    /* 打开文件 */
     fd_t OpenFile(const char *filename, FileAccessMode mode, error_t *errno_p)
     {
         int flags;
