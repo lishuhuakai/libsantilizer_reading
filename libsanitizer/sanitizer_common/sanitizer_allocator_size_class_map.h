@@ -117,97 +117,106 @@
 
 template <uptr kNumBits, uptr kMinSizeLog, uptr kMidSizeLog, uptr kMaxSizeLog,
           uptr kMaxNumCachedHintT, uptr kMaxBytesCachedLog>
-class SizeClassMap {
-  static const uptr kMinSize = 1 << kMinSizeLog;
-  static const uptr kMidSize = 1 << kMidSizeLog;
-  static const uptr kMidClass = kMidSize / kMinSize;
-  static const uptr S = kNumBits - 1;
-  static const uptr M = (1 << S) - 1;
+class SizeClassMap
+{
+    static const uptr kMinSize = 1 << kMinSizeLog;
+    static const uptr kMidSize = 1 << kMidSizeLog;
+    static const uptr kMidClass = kMidSize / kMinSize;
+    static const uptr S = kNumBits - 1;
+    static const uptr M = (1 << S) - 1;
 
- public:
-  // kMaxNumCachedHintT is a power of two. It serves as a hint
-  // for the size of TransferBatch, the actual size could be a bit smaller.
-  static const uptr kMaxNumCachedHint = kMaxNumCachedHintT;
-  COMPILER_CHECK((kMaxNumCachedHint & (kMaxNumCachedHint - 1)) == 0);
+public:
+    // kMaxNumCachedHintT is a power of two. It serves as a hint
+    // for the size of TransferBatch, the actual size could be a bit smaller.
+    static const uptr kMaxNumCachedHint = kMaxNumCachedHintT;
+    COMPILER_CHECK((kMaxNumCachedHint & (kMaxNumCachedHint - 1)) == 0);
 
-  static const uptr kMaxSize = 1UL << kMaxSizeLog;
-  static const uptr kNumClasses =
-      kMidClass + ((kMaxSizeLog - kMidSizeLog) << S) + 1;
-  static const uptr kLargestClassID = kNumClasses - 2;
-  COMPILER_CHECK(kNumClasses >= 16 && kNumClasses <= 256);
-  static const uptr kNumClassesRounded =
-      kNumClasses <= 32  ? 32 :
-      kNumClasses <= 64  ? 64 :
-      kNumClasses <= 128 ? 128 : 256;
+    static const uptr kMaxSize = 1UL << kMaxSizeLog;
+    static const uptr kNumClasses =
+        kMidClass + ((kMaxSizeLog - kMidSizeLog) << S) + 1;
+    static const uptr kLargestClassID = kNumClasses - 2;
+    COMPILER_CHECK(kNumClasses >= 16 && kNumClasses <= 256);
+    static const uptr kNumClassesRounded =
+        kNumClasses <= 32  ? 32 :
+        kNumClasses <= 64  ? 64 :
+        kNumClasses <= 128 ? 128 : 256;
 
-  static uptr Size(uptr class_id) {
-    if (class_id <= kMidClass)
-      return kMinSize * class_id;
-    class_id -= kMidClass;
-    uptr t = kMidSize << (class_id >> S);
-    return t + (t >> S) * (class_id & M);
-  }
-
-  static uptr ClassID(uptr size) {
-    if (size <= kMidSize)
-      return (size + kMinSize - 1) >> kMinSizeLog;
-    if (size > kMaxSize) return 0;
-    uptr l = MostSignificantSetBitIndex(size);
-    uptr hbits = (size >> (l - S)) & M;
-    uptr lbits = size & ((1 << (l - S)) - 1);
-    uptr l1 = l - kMidSizeLog;
-    return kMidClass + (l1 << S) + hbits + (lbits > 0);
-  }
-
-  static uptr MaxCachedHint(uptr class_id) {
-    if (class_id == 0) return 0;
-    uptr n = (1UL << kMaxBytesCachedLog) / Size(class_id);
-    return Max<uptr>(1, Min(kMaxNumCachedHint, n));
-  }
-
-  static void Print() {
-    uptr prev_s = 0;
-    uptr total_cached = 0;
-    for (uptr i = 0; i < kNumClasses; i++) {
-      uptr s = Size(i);
-      if (s >= kMidSize / 2 && (s & (s - 1)) == 0)
-        Printf("\n");
-      uptr d = s - prev_s;
-      uptr p = prev_s ? (d * 100 / prev_s) : 0;
-      uptr l = s ? MostSignificantSetBitIndex(s) : 0;
-      uptr cached = MaxCachedHint(i) * s;
-      Printf("c%02zd => s: %zd diff: +%zd %02zd%% l %zd "
-             "cached: %zd %zd; id %zd\n",
-             i, Size(i), d, p, l, MaxCachedHint(i), cached, ClassID(s));
-      total_cached += cached;
-      prev_s = s;
+    static uptr Size(uptr class_id)
+    {
+        if (class_id <= kMidClass)
+            return kMinSize * class_id;
+        class_id -= kMidClass;
+        uptr t = kMidSize << (class_id >> S);
+        return t + (t >> S) * (class_id & M);
     }
-    Printf("Total cached: %zd\n", total_cached);
-  }
 
-  static void Validate() {
-    for (uptr c = 1; c < kNumClasses; c++) {
-      // Printf("Validate: c%zd\n", c);
-      uptr s = Size(c);
-      CHECK_NE(s, 0U);
-      CHECK_EQ(ClassID(s), c);
-      if (c != kNumClasses - 1)
-        CHECK_EQ(ClassID(s + 1), c + 1);
-      CHECK_EQ(ClassID(s - 1), c);
-      if (c)
-        CHECK_GT(Size(c), Size(c-1));
+    static uptr ClassID(uptr size)
+    {
+        if (size <= kMidSize)
+            return (size + kMinSize - 1) >> kMinSizeLog;
+        if (size > kMaxSize) return 0;
+        uptr l = MostSignificantSetBitIndex(size);
+        uptr hbits = (size >> (l - S)) & M;
+        uptr lbits = size & ((1 << (l - S)) - 1);
+        uptr l1 = l - kMidSizeLog;
+        return kMidClass + (l1 << S) + hbits + (lbits > 0);
     }
-    CHECK_EQ(ClassID(kMaxSize + 1), 0);
 
-    for (uptr s = 1; s <= kMaxSize; s++) {
-      uptr c = ClassID(s);
-      // Printf("s%zd => c%zd\n", s, c);
-      CHECK_LT(c, kNumClasses);
-      CHECK_GE(Size(c), s);
-      if (c > 0)
-        CHECK_LT(Size(c-1), s);
+    static uptr MaxCachedHint(uptr class_id)
+    {
+        if (class_id == 0) return 0;
+        uptr n = (1UL << kMaxBytesCachedLog) / Size(class_id);
+        return Max<uptr>(1, Min(kMaxNumCachedHint, n));
     }
-  }
+
+    static void Print()
+    {
+        uptr prev_s = 0;
+        uptr total_cached = 0;
+        for (uptr i = 0; i < kNumClasses; i++)
+        {
+            uptr s = Size(i);
+            if (s >= kMidSize / 2 && (s & (s - 1)) == 0)
+                Printf("\n");
+            uptr d = s - prev_s;
+            uptr p = prev_s ? (d * 100 / prev_s) : 0;
+            uptr l = s ? MostSignificantSetBitIndex(s) : 0;
+            uptr cached = MaxCachedHint(i) * s;
+            Printf("c%02zd => s: %zd diff: +%zd %02zd%% l %zd "
+                   "cached: %zd %zd; id %zd\n",
+                   i, Size(i), d, p, l, MaxCachedHint(i), cached, ClassID(s));
+            total_cached += cached;
+            prev_s = s;
+        }
+        Printf("Total cached: %zd\n", total_cached);
+    }
+
+    static void Validate()
+    {
+        for (uptr c = 1; c < kNumClasses; c++)
+        {
+            // Printf("Validate: c%zd\n", c);
+            uptr s = Size(c);
+            CHECK_NE(s, 0U);
+            CHECK_EQ(ClassID(s), c);
+            if (c != kNumClasses - 1)
+                CHECK_EQ(ClassID(s + 1), c + 1);
+            CHECK_EQ(ClassID(s - 1), c);
+            if (c)
+                CHECK_GT(Size(c), Size(c - 1));
+        }
+        CHECK_EQ(ClassID(kMaxSize + 1), 0);
+
+        for (uptr s = 1; s <= kMaxSize; s++)
+        {
+            uptr c = ClassID(s);
+            // Printf("s%zd => c%zd\n", s, c);
+            CHECK_LT(c, kNumClasses);
+            CHECK_GE(Size(c), s);
+            if (c > 0)
+                CHECK_LT(Size(c - 1), s);
+        }
+    }
 };
 
 typedef SizeClassMap<3, 4, 8, 17, 128, 16> DefaultSizeClassMap;
