@@ -1,10 +1,9 @@
 ## 1. 结构体定义
 
-### 1.1 内存分配器
-
-内存块的格式:
+`asan` 分配的内存块的格式如下:
 
 ```c
+// asan_allocator.cc
 // 通过以下的内存分配器分配的内存块(memory chunk)格式如下:
 // L L L L L L H H U U U U U U R R
 //   L -- left redzone words (0 or more bytes)
@@ -90,9 +89,10 @@ struct AsanChunk: ChunkBase
 };
 ```
 
-我们以`aarch64`为例:
+下文之中,我们会以`aarch64` 架构为例, 简要分析一下 `asan` 的实现逻辑, 下面是一些定义:
 
 ```c
+// asan_allocator.h
 typedef SizeClassMap<3, 4, 8, 17, 128, 16> DefaultSizeClassMap;
 
 // AArch64/SANITIZER_CAN_USER_ALLOCATOR64 is only for 42-bit VMA
@@ -111,6 +111,7 @@ struct AP64 {  // Allocator64 parameters. Deliberately using a short name.
   static const uptr kFlags = 0;
 };
 
+// map以及unmap函数,asan主要通过这两个函数向操作系统申请/释放内存
 struct AsanMapUnmapCallback {
     void OnMap(uptr p, uptr size) const;
     void OnUnmap(uptr p, uptr size) const;
@@ -123,15 +124,16 @@ typedef LargeMmapAllocator<AsanMapUnmapCallback> SecondaryAllocator; // 第二�
 typedef CombinedAllocator<PrimaryAllocator, AllocatorCache, SecondaryAllocator> AsanAllocator; // asan内存分配器
 ```
 
-asan的分配器定义如下:
+`asan` 的分配器定义如下:
 
 ```c
+// asan_allocator.cc
 struct Allocator // 分配器
 {
     static const uptr kMaxAllowedMallocSize = FIRST_32_SECOND_64(3UL << 30, 1ULL << 40);
     static const uptr kMaxThreadLocalQuarantine = FIRST_32_SECOND_64(1 << 18, 1 << 20);
 
-    AsanAllocator allocator;    // ASAN分配器
+    AsanAllocator allocator;    // ASAN内存分配器
     AsanQuarantine quarantine;  // 隔离区
     StaticSpinMutex fallback_mutex;
     AllocatorCache fallback_allocator_cache;
@@ -146,9 +148,10 @@ struct Allocator // 分配器
 }
 ```
 
-全局只有一个静态的内存分配器:
+全局有且仅有一个静态的内存分配器:
 
 ```c
+// asan_allocator.cc
 static Allocator instance(LINKER_INITIALIZED);
 
 static AsanAllocator &get_allocator()
@@ -157,11 +160,13 @@ static AsanAllocator &get_allocator()
 }
 ```
 
-### 1.2 sizeclass Map
+接下来,我们会逐一来解析一下这些定义之中一些非常重要的结构体.
 
-上层应用申请的内存的大小可能是任意的,上层应用申请多大,就实际分配多大一块内存这种内存分配策略并不利于asan的内存管理,而且容易造成较多的内存碎片,不方便内存的复用.
+### 1.1 sizeclass Map
 
-asan根据内存块的大小,对内存块进行了分类,一共有n类(n为kNumClasses),每一个类别都是一个sizeclass,每一类都对应一个内存区间:
+上层应用申请的内存的大小可能是任意的,上层应用申请多大,就实际分配多大一块内存这种内存分配策略并不利于 `asan` 的内存管理,而且容易造成较多的内存碎片,不方便内存的复用.
+
+`asan` 根据内存块的大小,对内存块进行了分类,一共有 `n` 类( `n` 为 `kNumClasses` ),每一个类别都是一个 `sizeclass` ,每一类都对应一个内存区间:
 
 |    内存区间    |  sizeclass   |
 | :------------: | :----------: |
@@ -177,6 +182,7 @@ asan根据内存块的大小,对内存块进行了分类,一共有n类(n为kNumC
 为了实现size <-> sizeclass的相互转换,定义了`SizeClassMap`这样一个模板类.
 
 ```c
+// asan_allocator.h
 // SizeClassMap maps allocation sizes into size classes and back.
 // Class 0 always corresponds to size 0.
 // The other sizes are controlled by the template parameters:
@@ -333,7 +339,7 @@ public:
         uptr n = (1UL << kMaxBytesCachedLog) / Size(class_id);
         return Max<uptr>(1, Min(kMaxNumCachedHint, n));
     }
-
+	/* 打印出每一个SizeClass的内存分配信息 */
     static void Print()
     {
         uptr prev_s = 0;
@@ -355,43 +361,17 @@ public:
         }
         Printf("Total cached: %zd\n", total_cached);
     }
-
-    static void Validate()
-    {
-        for (uptr c = 1; c < kNumClasses; c++)
-        {
-            // Printf("Validate: c%zd\n", c);
-            uptr s = Size(c);
-            CHECK_NE(s, 0U);
-            CHECK_EQ(ClassID(s), c);
-            if (c != kNumClasses - 1)
-                CHECK_EQ(ClassID(s + 1), c + 1);
-            CHECK_EQ(ClassID(s - 1), c);
-            if (c)
-                CHECK_GT(Size(c), Size(c - 1));
-        }
-        CHECK_EQ(ClassID(kMaxSize + 1), 0);
-
-        for (uptr s = 1; s <= kMaxSize; s++)
-        {
-            uptr c = ClassID(s);
-            // Printf("s%zd => c%zd\n", s, c);
-            CHECK_LT(c, kNumClasses);
-            CHECK_GE(Size(c), s);
-            if (c > 0)
-                CHECK_LT(Size(c - 1), s);
-        }
-    }
+	// ...
 };
 
 typedef SizeClassMap<3, 4, 8, 17, 128, 16> DefaultSizeClassMap;
 ```
 
-### 1.3 sizeclass Cache
+### 1.2 sizeclass Cache
 
-SizeClassAllocatorLocalCache其实就是一个缓存,用于存储每个级别的sizeclass的空闲内存块.
+`SizeClassAllocatorLocalCache` 其实就是一个缓存,用于存储每个级别的 `sizeclass` 的空闲内存块.
 
-它向外提供了Allocator接口,用于内存分配.
+它向外提供了 `Allocator` 接口,用于内存分配.
 
 ```c
 // Objects of this type should be used as local caches for SizeClassAllocator64
@@ -490,11 +470,194 @@ struct SizeClassAllocator64LocalCache // 模板类
 };
 ```
 
-### 1.4 第一内存分配器
+### 1.3 内存分配器
 
-对于aarch64而言,`SizeClassAllocator64<AP64>`是其第一分配器,我们来看一下sizeClassAllocator64是如何来实现的吧.
+ `asan` 实际会将两个内存分配器组合起来使用, 一个 `PrimaryAllocatior` 用于分配小内存, 一个 `SecondaryAllocator` 用于分配大内存.
+
+```cpp
+// sanitizer_allocator_combined.h
+// This class implements a complete memory allocator by using two
+// internal allocators:
+// PrimaryAllocator is efficient, but may not allocate some sizes (alignments).
+//  When allocating 2^x bytes it should return 2^x aligned chunk.
+// PrimaryAllocator is used via a local AllocatorCache.
+// SecondaryAllocator can allocate anything, but is not efficient.
+template <class PrimaryAllocator, class AllocatorCache,
+          class SecondaryAllocator>  // NOLINT
+class CombinedAllocator
+{
+public:
+    void InitCommon(bool may_return_null)
+    {
+        primary_.Init();
+        atomic_store(&may_return_null_, may_return_null, memory_order_relaxed);
+    }
+
+    void InitLinkerInitialized(bool may_return_null)
+    {
+        secondary_.InitLinkerInitialized(may_return_null);
+        stats_.InitLinkerInitialized();
+        InitCommon(may_return_null);
+    }
+
+    void Init(bool may_return_null)
+    {
+        secondary_.Init(may_return_null);
+        stats_.Init();
+        InitCommon(may_return_null);
+    }
+    /* 内存分配 */
+    void *Allocate(AllocatorCache *cache, uptr size, uptr alignment,
+                   bool cleared = false, bool check_rss_limit = false)
+    {
+        // Returning 0 on malloc(0) may break a lot of code.
+        if (size == 0)
+            size = 1;
+        if (size + alignment < size) return ReturnNullOrDieOnBadRequest();
+        if (check_rss_limit && RssLimitIsExceeded()) return ReturnNullOrDieOnOOM();
+        if (alignment > 8)
+            size = RoundUpTo(size, alignment);
+        void *res;
+        // 如果第一内存分配器可以分配, 就使用第一内存分配器来分配内存
+        bool from_primary = primary_.CanAllocate(size, alignment);
+        if (from_primary)
+            res = cache->Allocate(&primary_, primary_.ClassID(size));
+        else // 否则使用第二内存分配器来分配内存
+            res = secondary_.Allocate(&stats_, size, alignment);
+        if (alignment > 8)
+            CHECK_EQ(reinterpret_cast<uptr>(res) & (alignment - 1), 0);
+        if (cleared && res && from_primary)
+            internal_bzero_aligned16(res, RoundUpTo(size, 16));
+        return res;
+    }
+
+ 	// ...
+    
+    /* 内存释放 */
+    void Deallocate(AllocatorCache *cache, void *p)
+    {
+        if (!p) return;
+        if (primary_.PointerIsMine(p))
+            cache->Deallocate(&primary_, primary_.GetSizeClass(p), p);
+        else
+            secondary_.Deallocate(&stats_, p);
+    }
+    
+	/* 内存重分配 */
+    void *Reallocate(AllocatorCache *cache, void *p, uptr new_size,
+                     uptr alignment)
+    {
+        if (!p)
+            return Allocate(cache, new_size, alignment);
+        if (!new_size)
+        {
+            Deallocate(cache, p);
+            return nullptr;
+        }
+        CHECK(PointerIsMine(p));
+        uptr old_size = GetActuallyAllocatedSize(p);
+        uptr memcpy_size = Min(new_size, old_size);
+        void *new_p = Allocate(cache, new_size, alignment);
+        if (new_p)
+            internal_memcpy(new_p, p, memcpy_size);
+        Deallocate(cache, p);
+        return new_p;
+    }
+	/* 判断内存是否由本内存分配器分配 */
+    bool PointerIsMine(void *p)
+    {
+        if (primary_.PointerIsMine(p))
+            return true;
+        return secondary_.PointerIsMine(p);
+    }
+
+    bool FromPrimary(void *p)
+    {
+        return primary_.PointerIsMine(p);
+    }
+
+    void *GetBlockBegin(const void *p)
+    {
+        if (primary_.PointerIsMine(p))
+            return primary_.GetBlockBegin(p);
+        return secondary_.GetBlockBegin(p);
+    }
+
+    // This function does the same as GetBlockBegin, but is much faster.
+    // Must be called with the allocator locked.
+    void *GetBlockBeginFastLocked(void *p)
+    {
+        if (primary_.PointerIsMine(p))
+            return primary_.GetBlockBegin(p);
+        return secondary_.GetBlockBeginFastLocked(p);
+    }
+
+    uptr GetActuallyAllocatedSize(void *p)
+    {
+        if (primary_.PointerIsMine(p))
+            return primary_.GetActuallyAllocatedSize(p);
+        return secondary_.GetActuallyAllocatedSize(p);
+    }
+
+    uptr TotalMemoryUsed()
+    {
+        return primary_.TotalMemoryUsed() + secondary_.TotalMemoryUsed();
+    }
+
+    void InitCache(AllocatorCache *cache)
+    {
+        cache->Init(&stats_);
+    }
+
+    void DestroyCache(AllocatorCache *cache)
+    {
+        cache->Destroy(&primary_, &stats_);
+    }
+
+    void SwallowCache(AllocatorCache *cache)
+    {
+        cache->Drain(&primary_);
+    }
+
+    void GetStats(AllocatorStatCounters s) const
+    {
+        stats_.Get(s);
+    }
+	/* 打印统计信息 */
+    void PrintStats()
+    {
+        primary_.PrintStats();
+        secondary_.PrintStats();
+    }
+
+	/* 将内存返还给操作系统 */
+    void ReleaseToOS()
+    {
+        primary_.ReleaseToOS();
+    }
+
+    // Iterate over all existing chunks.
+    // The allocator must be locked when calling this function.
+    void ForEachChunk(ForEachChunkCallback callback, void *arg)
+    {
+        primary_.ForEachChunk(callback, arg);
+        secondary_.ForEachChunk(callback, arg);
+    }
+
+private:
+    PrimaryAllocator primary_;
+    SecondaryAllocator secondary_;
+    AllocatorGlobalStats stats_;
+    atomic_uint8_t may_return_null_;
+    atomic_uint8_t rss_limit_is_exceeded_;
+};
+```
+#### 1. 第一内存分配器
+
+对于 `aarch64` 而言,`SizeClassAllocator64<AP64>`是其第一分配器,我们来看一下 `sizeClassAllocator64` 是如何来实现的吧.
 
 ```c
+// sanitizer_allocator_primary64.h
 /* 64位内存分配器 */
 template <class Params>
 class SizeClassAllocator64
@@ -565,7 +728,7 @@ public:
     
     // 从分配器中获得内存块(大小为class_id对应的sizecalss的内存大小
     void GetFromAllocator(AllocatorStats *stat, uptr class_id, CompactPtrT *chunks, uptr n_chunks);
-
+	// 内存是否由本分配器分配出去
     bool PointerIsMine(const void *p)
     {
         uptr P = reinterpret_cast<uptr>(p);
@@ -659,7 +822,7 @@ public:
             RegionInfo *region = GetRegionInfo(class_id);
             total_mapped += region->mapped_user;
             n_allocated += region->n_allocated;
-            n_freed += region->n_freed;
+            n_freed += region->n_freed; // 空闲内存
         }
         Printf("Stats: SizeClassAllocator64: %zdM mapped in %zd allocations; "
                "remains %zd\n",
@@ -671,25 +834,6 @@ public:
         for (uptr class_id = 1; class_id < kNumClasses; class_id++)
             PrintStats(class_id, rss_stats[class_id]);
     }
-
-    // ForceLock() and ForceUnlock() are needed to implement Darwin malloc zone
-    // introspection API.
-    void ForceLock()
-    {
-        for (uptr i = 0; i < kNumClasses; i++)
-        {
-            GetRegionInfo(i)->mutex.Lock();
-        }
-    }
-
-    void ForceUnlock()
-    {
-        for (int i = (int)kNumClasses - 1; i >= 0; i--)
-        {
-            GetRegionInfo(i)->mutex.Unlock();
-        }
-    }
-
     // Iterate over all existing chunks.
     // The allocator must be locked when calling this function.
     void ForEachChunk(ForEachChunkCallback callback, void *arg)
@@ -719,7 +863,7 @@ public:
         return RoundUpTo(sizeof(RegionInfo) * kNumClassesRounded,
                          GetPageSizeCached());
     }
-
+	// 将内存返还给操作系统
     void ReleaseToOS()
     {
         for (uptr class_id = 1; class_id < kNumClasses; class_id++)
@@ -763,8 +907,8 @@ private:
 
     struct ReleaseToOsInfo
     {
-        uptr n_freed_at_last_release;
-        uptr num_releases;
+        uptr n_freed_at_last_release; // 上一次一共返还的内存的数目
+        uptr num_releases; // 尝试向操作系统返还内存的次数
     };
 
     struct RegionInfo
@@ -778,7 +922,7 @@ private:
         uptr mapped_meta;  // Bytes mapped for metadata.
         u32 rand_state; // Seed for random shuffle, used if kRandomShuffleChunks.
         uptr n_allocated, n_freed;  // Just stats.
-        ReleaseToOsInfo rtoi;
+        ReleaseToOsInfo rtoi; // 向操作系统返还内存的统计信息
     };
     COMPILER_CHECK(sizeof(RegionInfo) >= kCacheLineSize);
 
@@ -873,13 +1017,205 @@ private:
 };
 ```
 
-### 1.5 隔离区
+#### 2. 第二内存分配器
+
+我们来简单看一下 `LargeMmapAllocator` , 这个内存分配器主要用于分配大块内存,它实现非常简单.下面摘取了它的实现, 删掉了一些不相关的代码.
+
+```c
+// sanitizer_allocator.h
+// Allocators call these callbacks on mmap/munmap.
+struct NoOpMapUnmapCallback
+{
+  void OnMap(uptr p, uptr size) const { }
+  void OnUnmap(uptr p, uptr size) const { }
+};
+
+// This class can (de)allocate only large chunks of memory using mmap/unmap.
+// The main purpose of this allocator is to cover large and rare allocation
+// sizes not covered by more efficient allocators (e.g. SizeClassAllocator64).
+template <class MapUnmapCallback = NoOpMapUnmapCallback>
+class LargeMmapAllocator 
+{
+ public:
+  void InitLinkerInitialized(bool may_return_null) 
+  {
+    page_size_ = GetPageSizeCached();
+    atomic_store(&may_return_null_, may_return_null, memory_order_relaxed);
+  }
+
+  void Init(bool may_return_null) 
+  {
+    internal_memset(this, 0, sizeof(*this));
+    InitLinkerInitialized(may_return_null);
+  }
+  // 进行大内存的分配
+  void *Allocate(AllocatorStats *stat, uptr size, uptr alignment) 
+  {
+    CHECK(IsPowerOfTwo(alignment));
+    uptr map_size = RoundUpMapSize(size);
+    if (alignment > page_size_)
+      map_size += alignment;
+    // Overflow.
+    if (map_size < size) return ReturnNullOrDieOnBadRequest();
+    uptr map_beg = reinterpret_cast<uptr>(
+        MmapOrDie(map_size, "LargeMmapAllocator"));
+    CHECK(IsAligned(map_beg, page_size_)); // 这里实际直接调用mmap函数进行内存的分配
+    MapUnmapCallback().OnMap(map_beg, map_size); // 这里实际不会干任何事情
+    uptr map_end = map_beg + map_size;
+    uptr res = map_beg + page_size_;
+    if (res & (alignment - 1))  // Align.
+      res += alignment - (res & (alignment - 1));
+    CHECK(IsAligned(res, alignment));
+    CHECK(IsAligned(res, page_size_));
+    CHECK_GE(res + size, map_beg);
+    CHECK_LE(res + size, map_end);
+    Header *h = GetHeader(res);
+    h->size = size;
+    h->map_beg = map_beg;
+    h->map_size = map_size;
+    uptr size_log = MostSignificantSetBitIndex(map_size);
+    CHECK_LT(size_log, ARRAY_SIZE(stats.by_size_log));
+    {
+      SpinMutexLock l(&mutex_);
+      uptr idx = n_chunks_++;
+      chunks_sorted_ = false;
+      CHECK_LT(idx, kMaxNumChunks);
+      h->chunk_idx = idx;
+      chunks_[idx] = h;
+      stats.n_allocs++; // 记录下大内存分配的次数
+      stats.currently_allocated += map_size; // 累加内存分配的大小
+      stats.max_allocated = Max(stats.max_allocated, stats.currently_allocated);
+      stats.by_size_log[size_log]++;
+      stat->Add(AllocatorStatAllocated, map_size); // 累加到总的内存分配大小中去
+      stat->Add(AllocatorStatMapped, map_size);
+    }
+    return reinterpret_cast<void*>(res);
+  }
+  // ...
+  // 内存释放 
+  void Deallocate(AllocatorStats *stat, void *p) 
+  {
+    Header *h = GetHeader(p);
+    {
+      SpinMutexLock l(&mutex_);
+      uptr idx = h->chunk_idx;
+      CHECK_EQ(chunks_[idx], h);
+      CHECK_LT(idx, n_chunks_);
+      chunks_[idx] = chunks_[n_chunks_ - 1];
+      chunks_[idx]->chunk_idx = idx;
+      n_chunks_--;
+      chunks_sorted_ = false;
+      stats.n_frees++;
+      stats.currently_allocated -= h->map_size;
+      stat->Sub(AllocatorStatAllocated, h->map_size);
+      stat->Sub(AllocatorStatMapped, h->map_size);
+    }
+    MapUnmapCallback().OnUnmap(h->map_beg, h->map_size); // 这里什么也不干
+    UnmapOrDie(reinterpret_cast<void*>(h->map_beg), h->map_size); // 这里实际调用unmap回收内存
+  }
+  // 计算总共使用的内存的数目
+  uptr TotalMemoryUsed() 
+  {
+    SpinMutexLock l(&mutex_);
+    uptr res = 0;
+    for (uptr i = 0; i < n_chunks_; i++) {
+      Header *h = chunks_[i];
+      CHECK_EQ(h->chunk_idx, i);
+      res += RoundUpMapSize(h->size);
+    }
+    return res;
+  }
+
+  // ....
+  // 打印统计信息
+  void PrintStats() 
+  {
+    // 这里打印通过LargeMmap内存分配器分配的内存
+    Printf("Stats: LargeMmapAllocator: allocated %zd times, "
+           "remains %zd (%zd K) max %zd M; by size logs: ",
+           stats.n_allocs, stats.n_allocs - stats.n_frees,
+           stats.currently_allocated >> 10, stats.max_allocated >> 20);
+    for (uptr i = 0; i < ARRAY_SIZE(stats.by_size_log); i++)
+    {
+      uptr c = stats.by_size_log[i];
+      if (!c) continue;
+      Printf("%zd:%zd; ", i, c);
+    }
+    Printf("\n");
+  }
+  // ...
+
+ private:
+  static const int kMaxNumChunks = 1 << FIRST_32_SECOND_64(15, 18);
+  struct Header {
+    uptr map_beg;
+    uptr map_size;
+    uptr size;
+    uptr chunk_idx;
+  };
+  // ...
+  uptr RoundUpMapSize(uptr size) 
+  {
+    return RoundUpTo(size, page_size_) + page_size_;
+  }
+
+  uptr page_size_;
+  Header *chunks_[kMaxNumChunks];
+  uptr n_chunks_;
+  uptr min_mmap_, max_mmap_;
+  bool chunks_sorted_;
+  struct Stats {
+    uptr n_allocs, n_frees, currently_allocated, max_allocated, by_size_log[64];
+  } stats;
+  atomic_uint8_t may_return_null_;
+  SpinMutex mutex_;
+};
+```
+
+下面摘录一下 `MmapOrDie` 以及 `UnmapOrDie` 函数的实现( `sanitizer_posix.cc` ):
+
+```c
+    /* 执行mmap操作
+     * @param size 需要分配的内存的大小
+     */
+    void *MmapOrDie(uptr size, const char *mem_type, bool raw_report)
+    {
+        size = RoundUpTo(size, GetPageSizeCached()); /* 对于4k的页来说,这里要求size至少是4k */
+        uptr res = internal_mmap(nullptr, size,
+                                 PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANON, -1, 0);
+        int reserrno;
+        if (internal_iserror(res, &reserrno))
+            ReportMmapFailureAndDie(size, mem_type, "allocate", reserrno, raw_report);
+        IncreaseTotalMmap(size);
+        return (void *)res;
+    }
+    /* 执行unmap操作
+     * @param addr 待回收的首地址
+     * @param size 内存块大小
+     */
+    void UnmapOrDie(void *addr, uptr size)
+    {
+        if (!addr || !size) return;
+        uptr res = internal_munmap(addr, size);
+        if (internal_iserror(res))
+        {
+            Report("ERROR: %s failed to deallocate 0x%zx (%zd) bytes at address %p\n",
+                   SanitizerToolName, size, size, addr);
+            CHECK("unable to unmap" && 0);
+        }
+        DecreaseTotalMmap(size);
+    }
+```
+
+### 1.4 隔离区
 
 为了检测内存访问是否正常,上层应用释放内存之后,asan并不会立即将其归还给操作系统,而是会暂时缓存起来,放在隔离区内.
 
 只有当隔离区缓存的内存达到上限,才会触发内存回收操作.
 
 ```c
+// sanitizer_quarantine.h
 template<typename Node> class QuarantineCache;
 
 struct QuarantineBatch
@@ -1066,7 +1402,7 @@ private:
 };
 ```
 
-以上隔离区中涉及的Callback实际是下面的QuarantineCallback.
+以上隔离区中涉及的 `Callback` 实际是下面的 `QuarantineCallback` .
 
 ```c
 struct QuarantineCallback
@@ -1251,7 +1587,7 @@ void *Allocate(uptr size, uptr alignment, BufferedStackTrace *stack,
         meta[0] = size;
         meta[1] = chunk_beg;
     }
-    m->alloc_context_id = StackDepotPut(*stack);
+    m->alloc_context_id = StackDepotPut(*stack); // 记录下堆栈信息, 将堆栈转换为一个唯一的context_id
 
     uptr size_rounded_down_to_granularity = RoundDownTo(size, SHADOW_GRANULARITY);
     // Unpoison the bulk of the memory region.
@@ -1265,8 +1601,8 @@ void *Allocate(uptr size, uptr alignment, BufferedStackTrace *stack,
     }
 
     AsanStats &thread_stats = GetCurrentThreadStats();
-    thread_stats.mallocs++;
-    thread_stats.malloced += size;
+    thread_stats.mallocs++; // 调用malloc次数+1
+    thread_stats.malloced += size; // 统计分配内存数目
     thread_stats.malloced_redzones += needed_size - size;
     if (needed_size > SizeClassMap::kMaxSize)
         thread_stats.malloc_large++; // 大内存分配计数
@@ -2062,7 +2398,7 @@ void Deallocate(void *ptr, uptr delete_size, BufferedStackTrace *stack, AllocTyp
 
 释放的内存并不会直接回收给操作系统,而是先放入隔离区.
 
-`Allocator::QuarantineChunk`会将要释放的内存信息放入隔离区,这里需要注意一点,在将内存放入隔离区之前,会将内存毒化,表示这块内存已经释放了,也就是将释放的内存标记为0xfd.
+`Allocator::QuarantineChunk`会将要释放的内存信息放入隔离区,这里需要注意一点,在将内存放入隔离区之前,会将内存毒化,表示这块内存已经释放了,也就是将释放的内存标记为 `0xfd` .
 
 ```c
 // Expects the chunk to already be marked as quarantined by using
@@ -2200,9 +2536,82 @@ void ReturnToAllocator(AllocatorStats *stat, uptr class_id, const CompactPtrT *c
 
 那么什么时候会将内存返还给操作系统呢?
 
-asan中提供了相应的接口:
+这个需要设置 `asan` 的相关参数, 在本人看的代码之中,需要将 `allocator_release_to_os` 这个参数设置为 `1`, `asan` 启动的时候, 会拉起一个线程,专门跑 `BackgroundThread` 函数,需要注意的是, **如果不设置这个参数, `asan` 不会返还内存给操作系统.**
+
+到了这里,我顺带说一句,低版本的 `asan` 其实都不会返还内存给操作系统,所以 `asan` 进程的内存只增加不减少. 当然, `asan` 会复用这些内存.
+
+高版本的 `asan` 默认也不做这种事情,不过还是提供了相关的运行时参数,用户可以选择将内存返还给操作系统.
 
 ```c
+// sanitizer_common_libcdep.cc
+void BackgroundThread(void *arg)
+{
+  uptr hard_rss_limit_mb = common_flags()->hard_rss_limit_mb;
+  uptr soft_rss_limit_mb = common_flags()->soft_rss_limit_mb;
+  bool heap_profile = common_flags()->heap_profile;
+  bool allocator_release_to_os = common_flags()->allocator_release_to_os;
+  uptr prev_reported_rss = 0;
+  uptr prev_reported_stack_depot_size = 0;
+  bool reached_soft_rss_limit = false;
+  uptr rss_during_last_reported_profile = 0;
+  while (true) {
+    SleepForMillis(100); // 休眠100ms
+    uptr current_rss_mb = GetRSS() >> 20;
+    if (Verbosity()) { // 如果需要更多信息
+      // If RSS has grown 10% since last time, print some information.
+      if (prev_reported_rss * 11 / 10 < current_rss_mb) {
+        Printf("%s: RSS: %zdMb\n", SanitizerToolName, current_rss_mb);
+        prev_reported_rss = current_rss_mb;
+      }
+      // If stack depot has grown 10% since last time, print it too.
+      StackDepotStats *stack_depot_stats = StackDepotGetStats();
+      if (prev_reported_stack_depot_size * 11 / 10 <
+          stack_depot_stats->allocated) {
+        Printf("%s: StackDepot: %zd ids; %zdM allocated\n",
+               SanitizerToolName,
+               stack_depot_stats->n_uniq_ids,
+               stack_depot_stats->allocated >> 20);
+        prev_reported_stack_depot_size = stack_depot_stats->allocated;
+      }
+    }
+    // Check RSS against the limit.
+    if (hard_rss_limit_mb && hard_rss_limit_mb < current_rss_mb) {
+      Report("%s: hard rss limit exhausted (%zdMb vs %zdMb)\n",
+             SanitizerToolName, hard_rss_limit_mb, current_rss_mb);
+      DumpProcessMap();
+      Die(); // rss如果达到限制, 则立即挂掉
+    }
+    if (soft_rss_limit_mb) {
+      if (soft_rss_limit_mb < current_rss_mb && !reached_soft_rss_limit) {
+        reached_soft_rss_limit = true;
+        Report("%s: soft rss limit exhausted (%zdMb vs %zdMb)\n",
+               SanitizerToolName, soft_rss_limit_mb, current_rss_mb);
+        if (SoftRssLimitExceededCallback)
+          SoftRssLimitExceededCallback(true);
+      } else if (soft_rss_limit_mb >= current_rss_mb &&
+                 reached_soft_rss_limit) {
+        reached_soft_rss_limit = false;
+        if (SoftRssLimitExceededCallback)
+          SoftRssLimitExceededCallback(false);
+      }
+    }
+    // allocator_release_to_os设置为true, 而且设置了ReleseCallback,则调用此回调 
+    if (allocator_release_to_os && ReleseCallback) ReleseCallback();
+    // 如果开启课对分析
+    if (heap_profile &&
+        current_rss_mb > rss_during_last_reported_profile * 1.1) {
+      Printf("\n\nHEAP PROFILE at RSS %zdMb\n", current_rss_mb);
+      __sanitizer_print_memory_profile(90);
+      rss_during_last_reported_profile = current_rss_mb;
+    }
+  }
+}
+```
+
+`ReleseCallback` 实际是 `ReleaseToOS` 函数,它的实现如下:
+
+```c
+// asan_allocator.cc
 void ReleaseToOS()
 {
     instance.ReleaseToOS();
@@ -2212,6 +2621,7 @@ void ReleaseToOS()
 这里会调用`AsanAllocator::ReleaseToOS`:
 
 ```c
+// asan_allocator.cc
 void ReleaseToOS()
 {
     allocator.ReleaseToOS();
@@ -2221,6 +2631,7 @@ void ReleaseToOS()
 `CombinedAllocator::ReleaseToOS`:
 
 ```c
+// sanitizer_allocator_combined.h
 void ReleaseToOS()
 {
     primary_.ReleaseToOS();
@@ -2230,6 +2641,7 @@ void ReleaseToOS()
 `SizeClassAllocator64::ReleaseToOS`:
 
 ```c
+// sanitizer_allocator_primary64.h
 // Releases some RAM back to OS.
 // Algorithm:
 // * Lock the region.
@@ -2263,8 +2675,8 @@ void ReleaseToOS(uptr class_id)
             if (prev + scaled_chunk_size - beg >= kScaledGranularity)
             {
                 MaybeReleaseChunkRange(region_beg, chunk_size, beg, prev);
-                region->rtoi.n_freed_at_last_release = region->n_freed;
-                region->rtoi.num_releases++;
+                region->rtoi.n_freed_at_last_release = region->n_freed; // 记录下本次返还的内存的数目
+                region->rtoi.num_releases++; // 返还次数+1
             }
             beg = chunk;
         }
